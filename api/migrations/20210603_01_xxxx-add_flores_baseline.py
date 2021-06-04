@@ -29,7 +29,7 @@ TRACK_LANGS: dict[str, list[str]] = {
 }
 
 
-def read_csv_results(split: str) -> dict[str, dict[str, float]]:
+def read_csv_scores(split: str) -> dict[str, dict[str, float]]:
     file = Path(__file__).with_suffix(f".{split}.csv")
     header, *lines = file.read_text().splitlines()
     langs = [l for l in header.split(",") if l]
@@ -50,11 +50,11 @@ def read_csv_results(split: str) -> dict[str, dict[str, float]]:
     return scores
 
 
-def to_metadata_dict(task: str, results: dict) -> dict:
+def to_metadata_dict(task: str, scores: dict) -> dict:
     langs = TRACK_LANGS[task]
     perf_by_tag = []
     bleu_sum, count = 0, 0
-    for src, row in results.items():
+    for src, row in scores.items():
         if src not in langs:
             continue
         for tgt, score in row.items():
@@ -81,27 +81,22 @@ def curry(f):
 
 
 def get_tid(cursor, task_code: str) -> str:
-    print(f"SELECT id FROM tasks WHERE task_code='{task_code}'")
     assert cursor.execute(f"SELECT id FROM tasks WHERE task_code='{task_code}'") == 1
     results = cursor.fetchall()
-    print(results)
     assert len(results) == 1
     tid = results[0][0]
     return tid
 
 
 def get_round_id(cursor, tid: str) -> str:
-    print(f"SELECT id FROM rounds WHERE tid='{tid}' AND rid=1")
     assert cursor.execute(f"SELECT id FROM rounds WHERE tid='{tid}' AND rid=1")
     results = cursor.fetchall()
-    print(results)
     assert len(results) == 1
     round_id = results[0][0]
     return round_id
 
 
 def get_did(cursor, tid: str, split: str):
-    print(f"SELECT id, name FROM datasets WHERE tid='{tid}'")
     assert cursor.execute("SELECT id, name FROM datasets WHERE tid=%s", (tid,))
     results = cursor.fetchall()
     # print(results)
@@ -114,10 +109,8 @@ def get_did(cursor, tid: str, split: str):
 
 
 def get_mid(cursor, task):
-    print(f"SELECT id FROM models WHERE name='M2M-124-615M-csv-{task}'")
     cursor.execute(f"SELECT id FROM models WHERE name='M2M-124-615M-csv-{task}'")
     results = cursor.fetchall()
-    print(results)
     assert len(results) == 1
     mid = results[0][0]
     return mid
@@ -126,6 +119,9 @@ def get_mid(cursor, task):
 @curry
 def insert_model(task: str, conn):
     cursor = conn.cursor()
+    exists = cursor.execute(f"SELECT id FROM models WHERE name='M2M-124-615M-csv-{task}'")
+    if exists:
+        return
     cursor.execute(
         """INSERT INTO `models` (tid, uid, name, shortname, `desc`)
     VALUES (%s, 1, %s, %s, %s)""",
@@ -136,43 +132,44 @@ def insert_model(task: str, conn):
             "M2M-124 model (615M params) from Flores 101 paper",
         ),
     )
-    conn.commit()
 
 
 @curry
-def insert_results(task: str, split: str, conn):
-    scores = read_csv_results(split)
+def insert_scores(task: str, split: str, conn):
+    scores = read_csv_scores(split)
     metadata_json = to_metadata_dict(task, scores)
     file = Path(__file__).parent.parent.parent / f"M2M-124-675M-csv-{task}-{split}.json"
-    print(f"Task {task} split {split}")
     file.write_text(json.dumps(metadata_json))
     cursor = conn.cursor()
     tid = get_tid(cursor, task)
-    query = """
-        INSERT INTO `results`
-        (mid, r_realid, did, `desc`, metadata_json)
-        VALUES (%s, %s, %s, %s, %s)"""
+    sp_bleu = metadata_json["sp_bleu"]
+    insert_query = """
+        INSERT INTO `scores`
+        (mid, r_realid, did, `desc`, metadata_json, perf, pretty_perf)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
     args = (
         get_mid(cursor, task=task),
         get_round_id(cursor, tid=tid),
         get_did(cursor, tid=tid, split=split),
         "M2M-124 model (615M params) scores from Flores 101 paper",
         json.dumps(metadata_json),
+        sp_bleu,
+        f"{sp_bleu:.1f}",
     )
-    # print(query % args)
-    # cursor.execute(query, args)
+    cursor.execute(insert_query, args)
 
 
 @curry
-def delete_results(task: str, split: str, conn):
+def delete_scores(task: str, split: str, conn):
     cursor = conn.cursor()
     tid = get_tid(cursor, task)
     cursor.execute(
-        "DELETE FROM results WHERE mid=%s AND r_realid=%s AND did=%s",
+        "DELETE FROM scores WHERE mid=%s AND r_realid=%s AND did=%s",
         (
             get_mid(cursor, task=task),
-            get_did(cursor, tid=tid, split=split),
             get_round_id(cursor, tid=tid),
+            get_did(cursor, tid=tid, split=split),
         ),
     )
 
@@ -187,4 +184,4 @@ for task in tasks:
         )
     )
     for split in ["dev", "devtest"]:
-        steps.append(step(insert_results(task, split), delete_results(task, split)))
+        steps.append(step(insert_scores(task, split), delete_scores(task, split)))
